@@ -12,6 +12,7 @@ from fracture_analysis so the meshed region is the exact same load-bearing struc
 
 import sys, os, argparse
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import matplotlib
@@ -19,45 +20,30 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from fracture_analysis import (build_connectivity, largest_component,
-                               reconnect, reconnect_closing)
+from fracture_pipeline.conversion import (
+    load_design_file, mirror_half_beam, repair_connectivity, largest_connected_component,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 def load_grid(design_path, mirror=True, reconnect_mode="none", bridge_width=2,
               keep_largest=False):
     """
-    Density file into binary material grid (Ny, Nx), 1=material. FEM j=0=bottom.
+    Density file into binary material grid (Ny, Nx), 1=material (black pixel
+    for PNGs). FEM j=0=bottom. Delegates to fracture_pipeline.conversion so
+    it uses exactly the same loader as fracture_analysis.run_fracture.
     """
-    design_path = str(design_path)
-    if design_path.lower().endswith((".png", ".jpg", ".jpeg")):
-        from PIL import Image
-        img = np.array(Image.open(design_path).convert("L")).astype(float)
-        rho = np.flipud((img/255.0 < 0.5).astype(float))    # BLACK = material
-    else:
-        rho = np.load(design_path).astype(float)
-        if rho.ndim == 3: rho = rho[0]
-        rho = np.flipud((rho >= 0.5).astype(float))          # high = material
+    rho = load_design_file(design_path)
 
     if mirror:
-        rho = np.hstack([rho[:, ::-1], rho])
+        rho = mirror_half_beam(rho)
 
-    orig = rho >= 0.5
-    if reconnect_mode == "closing":
-        solid, bridge = reconnect_closing(orig)
-    elif reconnect_mode == "bridge":
-        solid, bridge = reconnect(orig, width=bridge_width)
-    else:
-        solid, bridge = orig.copy(), np.zeros_like(orig)
+    solid, bridge = repair_connectivity(rho, mode=reconnect_mode, bridge_width=bridge_width)
 
     if not keep_largest:
         return solid, bridge
-    # only the largest connected component
-    Ny, Nx = solid.shape
-    en, _ = build_connectivity(Nx, Ny)
-    _, active_elems = largest_component(solid.astype(float), en, (Nx+1)*(Ny+1))
-    keep = np.zeros(Nx*Ny, bool); keep[active_elems] = True
-    return keep.reshape(Ny, Nx), bridge
+    kept, _dropped = largest_connected_component(solid)
+    return kept, bridge
 
 
 def triangulate(solid, hx=None, mirror=True):
@@ -154,9 +140,20 @@ def _draw_mesh(ax, points, triangles, facets):
 def plot_mesh(path, points, triangles, facets):
     fig, ax = plt.subplots(figsize=(11, 4))
     _draw_mesh(ax, points, triangles, facets)
-    ax.set_title(f"Mesh of the material ({len(points)} nodes, {len(triangles)} triangles)"
-                 f" — green=support (bottom), red=load (top); white=empty", fontsize=10)
-    plt.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
+    ax.set_axis_off()                                 # no frame, no ticks, no title bg
+    xmin, xmax = points[:, 0].min(), points[:, 0].max()
+    ymin, ymax = points[:, 1].min(), points[:, 1].max()
+    pad = 0.06 * (ymax - ymin)
+    xc = 0.5 * (xmin + xmax)
+    ax.text(xc, ymax + pad, "Load", color="red", ha="center", va="bottom",
+            fontsize=14, fontweight="bold")
+    ax.text(xc, ymin - pad, "Support", color="green", ha="center", va="top",
+            fontsize=14, fontweight="bold")
+    ax.set_ylim(ymin - 2.2 * pad, ymax + 2.2 * pad)
+    plt.tight_layout()
+    fig.savefig(path, dpi=130)
+    fig.savefig(str(path).rsplit(".", 1)[0] + ".eps", format="eps")
+    plt.close(fig)
 
 
 def plot_design_vs_mesh(path, design_path, points, triangles, facets, mirror):
@@ -177,7 +174,10 @@ def plot_design_vs_mesh(path, design_path, points, triangles, facets, mirror):
     _draw_mesh(a2, points, triangles, facets)
     a2.set_title(f"Triangular mesh of the material{' (mirrored full beam)' if mirror else ''} "
                  f"— green=support, red=load", fontsize=10)
-    plt.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
+    plt.tight_layout()
+    fig.savefig(path, dpi=130)
+    fig.savefig(str(path).rsplit(".", 1)[0] + ".eps", format="eps")
+    plt.close(fig)
 
 
 def convert(design_path, out_dir="mesh_output", mirror=True,
