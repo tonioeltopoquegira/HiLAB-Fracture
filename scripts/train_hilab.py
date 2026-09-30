@@ -2,7 +2,6 @@ import os
 import math
 import random
 from typing import List, Tuple, Dict
-from xml.parsers.expat import model
 
 import numpy as np
 import torch
@@ -22,10 +21,7 @@ except Exception:
         import timm
     except Exception:
         timm = None
-from typing import Tuple
-import numpy as np
-import torch
-from torch.utils.data import TensorDataset, DataLoader
+from connectivity_losses import connectivity_loss_pde_differentiable
 
 
 #  Utilities
@@ -266,6 +262,20 @@ class ViTVAE(nn.Module):
         return recon, mu, logvar
 
 
+def load_vitvae(path, latent_dim=None):
+    """Load a ViTVAE checkpoint ({'state', 'meta'} or a bare state dict) in
+    eval mode. Architecture comes from meta; only shape-matching keys load."""
+    ck = torch.load(path, map_location="cpu")
+    meta = ck.get("meta", {})
+    state = ck.get("state", ck)
+    latent_dim = latent_dim or int(meta.get("latent_dim", 16))
+    model = ViTVAE(latent_dim=latent_dim, size_decoder=meta.get("size_decoder", "xlarge"))
+    model_state = model.state_dict()
+    model_state.update({k: v for k, v in state.items()
+                        if k in model_state and model_state[k].shape == v.shape})
+    model.load_state_dict(model_state)
+    return model.eval()
+
 
 class VAELoss(nn.Module):
     def __init__(self, recon_type="mse", kl_weight=1e-3, recon_weight=1.0, binarization_weight=0.0):
@@ -369,15 +379,15 @@ def make_optimizer(model):
 
     return optim.AdamW(
         [
-            {"params": vit_params, "lr": 1e-5},
-            {"params": head_params, "lr": 5e-5},
+            {"params": vit_params, "lr": 7.5e-5},
+            {"params": head_params, "lr": 1e-4},
         ],
         weight_decay=1e-4,
     )
 
 
 
-def run_one_epoch(model, loader, optimizer, criterion, device, train=True):
+def run_one_epoch(model, loader, optimizer, criterion, device, train=True, connectivity_cfg=None):
     model.train() if train else model.eval()
 
     total_loss = 0.0
@@ -400,6 +410,35 @@ def run_one_epoch(model, loader, optimizer, criterion, device, train=True):
                 # stochastic
                 recon, mu, logvar = model(imgs)
                 loss, recon_loss, kld = criterion(recon, imgs, mu, logvar)
+
+                # Optional PDE-based connectivity regularizer
+                conn_weight = 0.0
+                if connectivity_cfg is not None:
+                    conn_weight = float(connectivity_cfg.get("weight", 0.0))
+                    solver_res = int(connectivity_cfg.get("solver_res", 32))
+                else:
+                    solver_res = 32
+
+                if conn_weight > 0.0:
+                    # Convert reconstruction to grayscale and resize to square for PDE loss
+                    gray = recon.mean(dim=1, keepdim=True)  # (B,1,H,W)
+                    gray_sq = F.interpolate(
+                        gray,
+                        size=(solver_res, solver_res),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                    conn_loss, _ = connectivity_loss_pde_differentiable(
+                        gray_sq,
+                        solver_res=solver_res,
+                        kappa_solid=1.0,
+                        kappa_void=1e-3,
+                        binarize=False,
+                        threshold=0.5,
+                        target=None,
+                    )
+                    loss = loss + conn_weight * conn_loss
             else:
                 # deterministic validation
                 mu, logvar = model.encode(imgs)
@@ -489,6 +528,8 @@ def sweep_thaw_depths_with_loaders(
     inspect_variance: bool = True,
     size_decoder: str = "small",
     init_model_path: str = None,
+    use_pde_connectivity: bool = False,
+    max_conn_weight: float = 1
 ):
     set_seed(123)
 
@@ -510,20 +551,43 @@ def sweep_thaw_depths_with_loaders(
                 print(f"Loading initial weights from '{init_model_path}'...")
                 state = torch.load(init_model_path, map_location=device)
 
-               
+                # Normalize to a plain state_dict
                 if isinstance(state, dict):
                     if "state_dict" in state and isinstance(state["state_dict"], dict):
-                        model.load_state_dict(state["state_dict"], strict=False)
+                        state_dict = state["state_dict"]
                     elif "state" in state and isinstance(state["state"], dict):
-                        model.load_state_dict(state["state"], strict=False)
+                        state_dict = state["state"]
                     else:
-                        
-                        model.load_state_dict(state, strict=False)
+                        state_dict = state
                 else:
-                    
-                    model.load_state_dict(state, strict=False)
+                    state_dict = state
 
-                print("Successfully loaded initial model weights.")
+                # First: try to load the full model (encoder + decoder) strictly.
+                try:
+                    model.load_state_dict(state_dict, strict=True)
+                    print("Successfully loaded full model (encoder + decoder) weights.")
+                except Exception as e_full:
+                    print("[WARN] Full model load failed, trying encoder-only vit weights.")
+                    print("       Full load error:", e_full)
+
+                    # Fallback: load only the encoder (ViT) weights if present.
+                    # Expect keys with prefix 'encoder.' in the checkpoint.
+                    encoder_prefix = "encoder."
+                    encoder_state = {
+                        k[len(encoder_prefix):]: v
+                        for k, v in state_dict.items()
+                        if isinstance(k, str) and k.startswith(encoder_prefix)
+                    }
+
+                    if not encoder_state:
+                        print("[WARN] No 'encoder.' keys found in checkpoint; encoder-only load skipped.")
+                    else:
+                        try:
+                            model.encoder.load_state_dict(encoder_state, strict=False)
+                            print("Successfully loaded encoder ViT weights only.")
+                        except Exception as e_enc:
+                            print("[ERROR] Failed to load encoder-only ViT weights:", e_enc)
+
             except Exception as e:
                 print(f"[ERROR] Failed to load initial model weights from '{init_model_path}': {e}")
 
@@ -537,21 +601,32 @@ def sweep_thaw_depths_with_loaders(
 
         # KL annealing schedule: epoch -> kl_weight
         kl_schedule = {
-            1:  1e-3,
-            3: 5e-3,
-            #3: 2e-2,
-            5: 5e-2,
-            7:1e-1,
-            8: 1.5e-1,
-            #3:  5e-3,
-            #5:  2e-2,
-            #7: 5e-2,
-            #9:1e-1,
-            #10:2e-1, # too big
-        }                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+            1:  5e-2,
+            2: 1e-1,
+            3: 1e-1,
+            4: 1.25e-1
+        }                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
 
         def get_kl_weight(epoch):
             return max(v for k, v in kl_schedule.items() if k <= epoch)
+
+        # PDE connectivity schedule: epoch -> (weight, solver_res)
+        # - weight is 0 until halfway through the epochs, then increases linearly
+        #   up to max_weight.
+        # - resolution starts at 32 and is bumped to 64 for the last 3 epochs.
+
+        def get_connectivity_schedule(epoch: int, total_epochs: int):
+            frac = epoch / float(total_epochs)
+            '''if frac <= 0.5:
+                w = 0.0
+            else:'''
+            w = max_conn_weight * (frac - 0.5) / 0.5
+
+            if epoch >= total_epochs - 2:
+                res = 64
+            else:
+                res = 32
+            return w, res
 
         val_mse_curve = []
         best_val = float("inf")
@@ -561,9 +636,40 @@ def sweep_thaw_depths_with_loaders(
             # KL annealing
             current_kl = get_kl_weight(epoch)
             criterion.kl_weight = current_kl
-            print(f"\n[Thaw={k}] Epoch {epoch}/{epochs_per_setting}  kl_weight={current_kl:.4f}")
-            train_metrics = run_one_epoch(model, train_loader, optimizer, criterion, device, train=True)
-            val_metrics   = run_one_epoch(model, val_loader,   optimizer, criterion, device, train=False)
+            # PDE connectivity schedule for this epoch (training only)
+            if use_pde_connectivity:
+                #conn_weight, conn_res = get_connectivity_schedule(epoch, epochs_per_setting)
+                conn_weight = max_conn_weight
+                conn_res = 64
+                connectivity_cfg = {"weight": conn_weight, "solver_res": conn_res}
+                #connectivity_cfg = {"weight": max_conn_weight, "solver_res": 32}
+            else:
+                conn_weight, conn_res = 0.0, 64
+                connectivity_cfg = None
+
+            print(
+                f"\n[Thaw={k}] Epoch {epoch}/{epochs_per_setting}  kl_weight={current_kl:.4f} "
+                f"| conn_weight={conn_weight:.4f} res={conn_res}"
+            )
+
+            train_metrics = run_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                train=True,
+                connectivity_cfg=connectivity_cfg,
+            )
+            val_metrics = run_one_epoch(
+                model,
+                val_loader,
+                optimizer,
+                criterion,
+                device,
+                train=False,
+                connectivity_cfg=None,
+            )
 
             print(f"Train: loss={train_metrics['loss']:.4f} | MSE={train_metrics['mse']:.6f} | PSNR={train_metrics['psnr']:.2f} dB")
             print(
@@ -586,7 +692,7 @@ def sweep_thaw_depths_with_loaders(
                     os.makedirs(f"examples/thaw{k}_latent{latent_dim}_dec{size_decoder}_{ts}", exist_ok=True)
                     save_grid(imgs, f"examples/thaw{k}_latent{latent_dim}_dec{size_decoder}_{ts}/input_epoch{epoch}.png")
                     save_grid(recon, f"examples/thaw{k}_latent{latent_dim}_dec{size_decoder}_{ts}/recon_epoch{epoch}.png")
-                    reconstruction_check(model, f"examples/thaw{k}_latent{latent_dim}_dec{size_decoder}_{ts}/epoch{epoch}_fullrecon.png")
+                    reconstruction_check(model, None, f"examples/thaw{k}_latent{latent_dim}_dec{size_decoder}_{ts}/epoch{epoch}_fullrecon.png") # CONFIG['val_dirs'][0]
                     
             if inspect_variance:
                 with torch.no_grad():
@@ -642,12 +748,14 @@ def sweep_thaw_depths_with_loaders(
 
 from reconstruction_check import load_images_as_nhwc, stretch, save_side_by_side_2x4
 
-def reconstruction_check(model, output_file):
+def reconstruction_check(model, load_file, output_file):
 
     # -------------------------
     # Load images
     # -------------------------
-    paths, orig_nhwc = load_images_as_nhwc("outputs/designs/mbb_beam_384x64_0.4-20260111-164330/images", resize=(128, 256))
+
+    # load_file
+    paths, orig_nhwc = load_images_as_nhwc('outputs/augmented/mbb_beam_192x64/test_images', resize=(128, 256))
     print("Found images:", len(paths), "example shape (H,W,C):", orig_nhwc.shape[1:])
 
     # Convert to NCHW using the SAME permutation 
@@ -707,9 +815,11 @@ if __name__ == "__main__":
       train_images: (N, 256, 128, 3)  | test_images: (M, 256, 128, 3)
       values in [0,1] or set normalize_from_uint8=True
     """
-    
-    CONFIG = {
-        # list of directories containing PNG/JPEG images for training
+
+    """
+    PAST TRAIN - TEST SETTINGS:
+
+    # list of directories containing PNG/JPEG images for training
         'train_dirs':['outputs/augmented/mbb_beam_384x64_0.4-20260111-164330',
                     'outputs/augmented/mbb_beam_384x64_0.4-20260111-201703',
                     'outputs/augmented/mbb_beam_384x64_0.4-20260111-221249',
@@ -727,6 +837,16 @@ if __name__ == "__main__":
                      'outputs/augmented/mbb_beam_384x64_0.4-20260113-205758/images',
                      #'outputs/designs/mbb_beam_384x64_0.4-20260113-205758/images',
                     ],
+    
+    """
+    
+    CONFIG = {
+        # list of directories containing PNG/JPEG images for training
+        'train_dirs':['outputs/augmented/mbb_beam_192x64/train_images',
+                      ],
+        # list of directories for validation
+        'val_dirs': ['outputs/augmented/mbb_beam_192x64/test_images', 
+                    ],
         # desired in-memory image size: (width, height) for PIL resize
         'resize': (128, 256),
         # whether to treat input files as uint8 and normalize automatically
@@ -735,7 +855,7 @@ if __name__ == "__main__":
         'num_workers': 4,
         # Optional: path to a checkpoint with initial model weights
         # Example: 'models/vitvae_thaw1_latent16_decodersizemedium_20260111-120000.pt'
-        'init_model_path': None,
+        #'init_model_path': 'models/vitvae_thaw4_latent8_decodersizelarge_20260327-132911_3.pt',
     }
 
 
@@ -803,14 +923,35 @@ if __name__ == "__main__":
     
     
     init_model_path = CONFIG.get('init_model_path')
-    for thaw, decoder_size, latent in zip([4], ["large"], [8]):
+    for thaw, decoder_size, latent in zip([8, 10], ["large", "large"], [10, 8]):
+
         results, curves = sweep_thaw_depths_with_loaders(
             train_loader, val_loader,
             thaw_depths=[thaw],
-            epochs_per_setting=8,
+            epochs_per_setting=4,
             latent_dim=latent, # try 8 as well
             recon_type='bce', # try bce as well
             kl_weight=0.0,
             size_decoder=decoder_size,
-            init_model_path=init_model_path,
+            init_model_path='',
+            use_pde_connectivity=False,
+            max_conn_weight=100.0
+            
         )
+
+
+    '''for thaw, decoder_size, latent in zip([10, 12], ["large", "large"], [8, 8]):
+
+        results, curves = sweep_thaw_depths_with_loaders(
+            train_loader, val_loader,
+            thaw_depths=[thaw],
+            epochs_per_setting=3,
+            latent_dim=latent, # try 8 as well
+            recon_type='bce', # try bce as well
+            kl_weight=0.0,
+            size_decoder=decoder_size,
+            init_model_path='models/vitvae_thaw7_latent8_decodersizelarge_20260330-234125_4.pt',
+            use_pde_connectivity=False,
+            max_conn_weight=100.0
+            
+        )'''

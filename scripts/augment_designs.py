@@ -28,9 +28,13 @@ SIGMAS = (0.5, 1.0, 1.5, 2.0, 2.5)
 # Top-level configuration dict (edit this directly; no CLI).
 CONFIG = {
     # list of input folders to collect images from
-    'input_dirs': ['outputs/designs/mbb_beam_384x64_0.4-20260113-231654'],
+    'input_dirs': [#'outputs/designs/mbb_beam_192x64_0.4-20260326-002029/images' ,
+        #'outputs/designs/mbb_beam_192x64_0.4-20260326-001411/images' ,
+        #'outputs/designs/mbb_beam_192x64_0.4-20260325-191803/images' ,
+        #'outputs/designs/mbb_beam_192x64_0.4-20260325-185804/images'
+        'outputs/designs/mbb_beam_192x64/mbb_beam_192x64_0.4-20260325-191803/images' ],
     # where to write augmented images (mirrors input structure under this dir)
-    'output_dir': 'outputs/augmented/',
+    'output_dir': 'outputs/augmented/mbb_beam_192x64/',
     # gaussian sigmas (pixels)
     'sigmas': list(SIGMAS),
     # scale factor used to convert sigma -> morphology kernel size

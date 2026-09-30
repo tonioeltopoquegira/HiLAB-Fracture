@@ -211,10 +211,8 @@ def optimality_criteria_combine(x, dc, dv, args, max_move=0.2, eta=0.5):
 
   def compute_xnew(inputs, lambda_):
     x, dc, dv = unpack(inputs)
-    # avoid dividing by zero outside the design region
-    dv = np.where(np.ravel(args['mask']) > 0, dv, 1)
-    # square root is not defined for negative numbers, which can happen due to
-    # small numerical errors in the computed gradients.
+    
+    dv = np.where(args['mask'] > 0, dv, 1)
     xnew = x * np.maximum(-dc / (lambda_ * dv), 0) ** eta
     lower = np.maximum(0.0, x - max_move)
     upper = np.minimum(1.0, x + max_move)

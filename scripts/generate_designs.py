@@ -45,19 +45,19 @@ def main():
         'output_dir': 'outputs/designs',
         'problem': 'mbb_beam_192x64_0.4', #'',
         'opt_steps': 200,
-        'volfrac': 0.5,
+        'volfrac': 0.4,
         'penal_start': None,
         'penal_end': None,
         'penal_power': None,
         'seed': 0,
         # how many designs to create per method (different seeds)
-        'n_designs_per_method': 400,
+        'n_designs_per_method': 2,
         # binarization threshold
         'binarize_threshold': 0.5,
         # if True, only save the left half of the design (mirrored symmetry)
         'save_half': True,
         # standard deviation of Gaussian noise to add to initial z (0 -> constant init)
-        'random_init_std': 0.1,
+        'random_init_std': 0.01,
     }
 
     cfg = CONFIG

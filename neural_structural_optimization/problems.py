@@ -313,7 +313,7 @@ def thin_support_bridge(
   mask = np.ones((width, height))
   mask[-round(width*(1-design_width)):, :round(height*(1-design_width))] = 0
 
-  return Problem(normals, forces, density, mask)
+  return Problem(normals, forces, density, mask.T)
 
 
 def drawbridge(width=32, height=32, density=0.25):

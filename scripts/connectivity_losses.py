@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from scripts.evaluate_conductivity import evaluate_design_conductivity, _load_augmented_images
+from evaluate_conductivity import evaluate_design_conductivity, _load_augmented_images
 
 
 Reduction = Literal["none", "mean", "sum"]

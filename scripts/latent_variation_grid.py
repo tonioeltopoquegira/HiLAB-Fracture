@@ -40,17 +40,52 @@ def stretch_to_rect(img, target_height=128, target_width=256):
 
 def load_decoder(path):
     ck = torch.load(path, map_location='cpu')
-    meta = ck.get('meta', {})
-    state = ck.get('state', ck)
-    size_decoder = meta.get('size_decoder', 'xlarge')
-    latent_dim = int(meta.get('latent_dim', 16))
+
+    # Handle both decoder-only checkpoints {"meta": ..., "state": ...}
+    # and full model.state_dict() checkpoints.
+    meta = ck.get('meta', {}) if isinstance(ck, dict) else {}
+    state = ck.get('state', ck) if isinstance(ck, dict) else ck
+
+    # --- Infer latent_dim robustly ---
+    latent_dim = meta.get('latent_dim', None)
+    if latent_dim is None:
+        # Fall back to decoder_input weight shape if present
+        w = state.get('decoder_input.weight', None) if isinstance(state, dict) else None
+        if w is not None:
+            latent_dim = int(w.shape[1])
+        else:
+            latent_dim = 16
+    latent_dim = int(latent_dim)
+
+    # --- Infer decoder size ---
+    size_decoder = meta.get('size_decoder', None)
+    if size_decoder is None:
+        # Try to parse from filename, e.g. ..._decodersizexxlarge_...
+        base = os.path.basename(path)
+        marker = 'decodersize'
+        idx = base.find(marker)
+        if idx != -1:
+            rest = base[idx + len(marker):]  # e.g. "xxlarge_2026...pt"
+            rest = rest.lstrip('_')
+            size = ''
+            for ch in rest:
+                if ch.isalpha():
+                    size += ch
+                else:
+                    break
+            size_decoder = size or 'xlarge'
+        else:
+            size_decoder = 'xlarge'
+
     model = ViTVAE(latent_dim=latent_dim, size_decoder=size_decoder)
     model_state = model.state_dict()
-    for k, v in state.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            model_state[k] = v
+    if isinstance(state, dict):
+        for k, v in state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                model_state[k] = v
     model.load_state_dict(model_state)
     model.eval()
+
     return model, latent_dim
 
 
@@ -139,8 +174,8 @@ def main():
     parser.add_argument('--base', type=str, default=None)
     parser.add_argument('--base_img', type=str, default=None)
     parser.add_argument('--full_model', type=str, default=None)
-    parser.add_argument('--schedule', nargs='+', default=['-3, -2, -1.0, -0.5, 1.0, 2.0, 3.0'])
-    parser.add_argument('--mode', choices=['add', 'replace'], default='replace')
+    parser.add_argument('--schedule', nargs='+', default=['-30, -15, -10, -3, -1.75, -1.0, -0.5, -0.25, -0.1, 0.1, 0.25, 0.5, 1.0, 1.75, 3, 10, 15, 30'])
+    parser.add_argument('--mode', choices=['add', 'replace'], default='replace') # use replace here
     parser.add_argument('--seed', type=int, default=123)
     parser.add_argument('--binarize_threshold', type=float, default=0.5)
     parser.add_argument('--no_binarize', action='store_true')
@@ -192,11 +227,11 @@ def main():
 if __name__ == '__main__':
     main()
 
-# --base "-0.205460,-1.144199, -1.789775, -0.902603, 1.777870, 0.828746, 0.444054, 1.197009"\
-# --base "0.305828, 1.073675, 0.639515, 0.339767, 2.682443, 0.515682, 1.378971, -0.196818"
+# GOOD!!!! --decoder models/vitvae_thaw12_latent16_decodersizexlarge_20260331-175856_7.pt --base "0.045162, 1.127895, 0.119890, -0.755302, -1.565912, 0.006889, 0.263238, 0.035379, 1.706719, -0.039534, -0.913579, 0.031903, -0.676718, 0.189038, -0.044928, 0.875544"
 
-# NOT BAD!!!
 
-#--base "-0.142843, -0.030754, -0.093442, -0.596072, 0.198657, 1.288095, -0.307844, 1.894389, 0.697677, 1.200793, -1.004479, 0.319866, -1.811832, 0.530297, -1.017856, 1.801798"
+# --decoder models/vitvae_thaw12_latent16_decodersizexlarge_20260331-175856_7.pt --base "-0.108936, -1.685004, -0.830466, 0.311497, -0.242089, -1.453514, 0.987660, 0.171305, -1.240917, -0.359046, 0.547461, 1.223390, -0.688281, 0.595105, -0.844123, -0.109817"
 
-# --base "0.378275, 0.005934, -0.821723, -1.323568, 1.853147, 0.018200, 0.325669, 1.070722, 0.039563, -0.877092, -1.023597, 0.792667, 1.459755, 1.191377, -0.159492, 1.013047"
+# --decoder models/vitvae_thaw12_latent16_decodersizexlarge_20260331-175856_7.pt --base "-1.075889, -1.722669, -0.702517, 0.672697, 0.154385, 1.338681, 0.701204, 1.227980, 0.477908, 0.453995, -0.093108, 0.561026, -1.838709, 0.724766, 0.504774, -0.629946"
+
+# --decoder models/vitvae_thaw12_latent16_decodersizexlarge_20260331-175856_7.pt --base "0.063760, -1.542693, 1.794732, 0.423650, -0.318330, 1.069292, 1.124658, 0.766357, 0.030349, -0.333916, 1.203473, 0.200562, -1.133881, 0.630170, -1.080765, -1.386261"

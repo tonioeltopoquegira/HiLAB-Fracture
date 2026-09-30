@@ -17,14 +17,15 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 # --- Config: adjust to your environment ---
-MODEL_PATH = "models/vitvae_thaw2_latent16_decodersizexlarge_20260223-102323_GOOD_EPOCH15.pt"   # full model (state_dict)
-IMAGE_DIR  = "outputs/designs/mbb_beam_384x64_0.4-20260111-164330/images"
+#MODEL_PATH = "models/vitvae_thaw12_latent16_decodersizexlarge_20260331-175856_7.pt"   # full model (state_dict)
+MODEL_PATH = 'models/vitvae_thaw12_latent8_decodersizexxlarge_20260401-010014_5.pt'
+IMAGE_DIR  = "outputs/augmented/mbb_beam_192x64/test_images"
 OUT_DIR    = f"recon_check/{os.path.splitext(os.path.basename(MODEL_PATH))[0]}"  
 BATCH_SIZE = 8
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 RESIZE     = (128, 256)  # (width, height) used in training
-LATENT_DIM = 16     # must match what you trained
-SIZE_DECODER = 'xlarge'
+LATENT_DIM = 8     # must match what you trained
+SIZE_DECODER = 'xxlarge'
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -100,7 +101,10 @@ def save_side_by_side_2x4(orig_nhwc, recon_nhwc, out_path, thresh=0.5, binarize 
     Plot 4 originals on the top row and binarized reconstructions on the bottom row.
     Layout: 2 x 4 grid.
     """
-    n = min(4, len(orig_nhwc))
+    n_samples = len(orig_nhwc)
+    if n_samples == 0:
+        raise ValueError("No images provided to save_side_by_side_2x4")
+
     if binarize:
         orig_bin =  binarize_nhwc(orig_nhwc, thresh=thresh)
 
@@ -109,16 +113,24 @@ def save_side_by_side_2x4(orig_nhwc, recon_nhwc, out_path, thresh=0.5, binarize 
         orig_bin = orig_nhwc
         recon_bin = recon_nhwc
 
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    # Choose up to 4 indices spread across the dataset so that
+    # examples are far apart in index space (not adjacent).
+    num_cols = 4
+    # Evenly spaced indices between 0 and n_samples-1
+    chosen_indices = np.linspace(0, n_samples - 1, num=min(num_cols, n_samples), dtype=int)
 
-    for i in range(4):
-        if i < n:
-            axes[0, i].imshow(orig_bin[i])
-            axes[0, i].set_title(f"Orig {i}")
-            axes[1, i].imshow(recon_bin[i])
-            axes[1, i].set_title(f"Recon ≥ {thresh}")
-        axes[0, i].axis("off")
-        axes[1, i].axis("off")
+    fig, axes = plt.subplots(2, num_cols, figsize=(12, 6))
+
+    for col, idx in enumerate(chosen_indices):
+        axes[0, col].imshow(orig_bin[idx])
+        axes[0, col].set_title(f"Orig {idx}")
+        axes[1, col].imshow(recon_bin[idx])
+        axes[1, col].set_title(f"Recon ≥ {thresh}")
+
+    # Hide any unused columns
+    for col in range(num_cols):
+        axes[0, col].axis("off")
+        axes[1, col].axis("off")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
